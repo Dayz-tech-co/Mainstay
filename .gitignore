@@ -14,7 +14,6 @@ contracts/engineer-registry/test_snapshots/
 **/*.snap
 
 # IDE / editor
-.vscode/
 .idea/
 *.iml
 *.swp
@@ -82,3 +81,7 @@ tarpaulin-report.html
 # Misc editor artifacts
 *.orig
 *.rej
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
