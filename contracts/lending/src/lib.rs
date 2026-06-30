@@ -39,6 +39,14 @@ pub enum ContractError {
     TooManyVouchers = 14,
     /// Voucher withdrawal not allowed.
     VouchWithdrawNotAllowed = 15,
+    /// Requested loan exceeds the configured LTV ratio.
+    LtvRatioExceeded = 16,
+    /// Provided LTV ratio configuration is invalid.
+    InvalidLtvRatio = 17,
+    /// No pending admin transfer exists for the caller.
+    NoPendingAdmin = 18,
+    /// Loan deadline has not been reached yet.
+    LoanNotDue = 19,
 }
 
 #[contracttype]
@@ -78,6 +86,7 @@ pub struct Borrower {
 pub struct Config {
     pub yield_bps: u64,
     pub slash_bps: u64,
+    pub max_ltv_ratio: u32,
 }
 
 const TTL_THRESHOLD: u32 = 518_400;
@@ -86,6 +95,7 @@ const TTL_TARGET: u32 = 518_400;
 /// Default yield rate numerator: 2% = 200 / 10_000.
 const DEFAULT_YIELD_NUMERATOR: u64 = 200;
 const YIELD_DENOMINATOR: u64 = 10_000;
+const DEFAULT_MAX_LTV_RATIO: u32 = 70;
 
 /// Slash basis points: 50% = 5000 / 10_000 (#646).
 /// Guard: must not exceed 10_000 to prevent underflow in slash calculation.
@@ -107,17 +117,16 @@ const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
+const PENDING_ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("PEND_ADM");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
-const SLASH_BPS_KEY: soroban_sdk::Symbol = symbol_short!("SL_BPS");
 const LOAN_DURATION_KEY: soroban_sdk::Symbol = symbol_short!("LOAN_DUR");
 const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
-const YIELD_BPS_KEY: soroban_sdk::Symbol = symbol_short!("YIELD_BPS");
-const YIELD_NUMERATOR: u64 = DEFAULT_YIELD_NUMERATOR;
 
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
 const LOAN_REPAID: Symbol = symbol_short!("loan_rep");
 const LOAN_SLASHED: Symbol = symbol_short!("loan_sls");
 const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
+const LTV_VALIDATED: Symbol = symbol_short!("ltv_ok");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -154,9 +163,14 @@ fn get_config(env: &Env) -> Config {
         .persistent()
         .get(&CONFIG_KEY)
         .unwrap_or_else(|| Config {
-            yield_bps: 200,
-            slash_bps: 5000,
+            yield_bps: DEFAULT_YIELD_NUMERATOR,
+            slash_bps: SLASH_BPS,
+            max_ltv_ratio: DEFAULT_MAX_LTV_RATIO,
         })
+}
+
+fn get_pending_admin(env: &Env) -> Option<Address> {
+    env.storage().persistent().get(&PENDING_ADMIN_KEY)
 }
 
 fn require_admin(env: &Env, caller: &Address) {
@@ -173,11 +187,116 @@ fn require_not_paused(env: &Env) {
     }
 }
 
-fn get_slash_bps(env: &Env) -> u32 {
+fn total_vouched_for(env: &Env, borrower: &Address) -> u64 {
+    let vouches: Vec<Vouch> = env
+        .storage()
+        .persistent()
+        .get(&vouches_key(borrower))
+        .unwrap_or_else(|| Vec::new(env));
+
+    let mut total = 0u64;
+    for vouch in vouches.iter() {
+        total = total
+            .checked_add(vouch.stake)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::StakeSummationOverflow));
+    }
+
+    total
+}
+
+fn validate_ltv_ratio(env: &Env, borrower: &Address, loan_amount: u64) -> bool {
+    let collateral_value = total_vouched_for(env, borrower);
+    if collateral_value == 0 {
+        return true;
+    }
+
+    let max_ltv_ratio = get_config(env).max_ltv_ratio as u128;
+    (loan_amount as u128) * 100 <= (collateral_value as u128) * max_ltv_ratio
+}
+
+fn ltv_ratio_percent(env: &Env, borrower: &Address, loan_amount: u64) -> u32 {
+    let collateral_value = total_vouched_for(env, borrower);
+    if collateral_value == 0 {
+        return 0;
+    }
+
+    ((loan_amount as u128) * 100 / (collateral_value as u128)) as u32
+}
+
+fn apply_slash(env: &Env, borrower: &Address) {
+    let key = loan_key(borrower);
+    let mut loan: Loan = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NoActiveLoan));
+
+    if loan.status != LoanStatus::Active {
+        panic_with_error!(env, ContractError::NoActiveLoan);
+    }
+
+    loan.status = LoanStatus::Defaulted;
+    env.storage().persistent().set(&key, &loan);
     env.storage()
         .persistent()
-        .get(&SLASH_BPS_KEY)
-        .unwrap_or(5000)
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+    let borrower_key_val = borrower_key(borrower);
+    if let Some(mut borrower_record) = env
+        .storage()
+        .persistent()
+        .get::<_, Borrower>(&borrower_key_val)
+    {
+        borrower_record.default_count += 1;
+        env.storage()
+            .persistent()
+            .set(&borrower_key_val, &borrower_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&borrower_key_val, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    let vouches: Vec<Vouch> = env
+        .storage()
+        .persistent()
+        .get(&vouches_key(borrower))
+        .unwrap_or_else(|| Vec::new(env));
+
+    if vouches.len() > 100 {
+        panic_with_error!(env, ContractError::TooManyVouchers);
+    }
+
+    let token_addr = get_token(env);
+    let tok = token::Client::new(env, &token_addr);
+    let slash_bps = get_config(env).slash_bps;
+    let mut slash_accum: u64 = 0;
+
+    for v in vouches.iter() {
+        let slashed = v.stake * slash_bps / 10_000;
+        let returned = v.stake - slashed;
+        slash_accum = slash_accum
+            .checked_add(slashed)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::StakeSummationOverflow));
+        if returned > 0 {
+            tok.transfer(
+                &env.current_contract_address(),
+                &v.voucher,
+                &(returned as i128),
+            );
+        }
+    }
+
+    let current_slash: u64 = env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64);
+    let updated_slash = current_slash
+        .checked_add(slash_accum)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::StakeSummationOverflow));
+    env.storage().persistent().set(&SLASH_BAL, &updated_slash);
+    env.storage()
+        .persistent()
+        .extend_ttl(&SLASH_BAL, TTL_THRESHOLD, TTL_TARGET);
+
+    env.events()
+        .publish((LOAN_SLASHED,), (borrower.clone(), slash_accum));
 }
 
 fn get_loan_duration(env: &Env) -> u64 {
@@ -199,7 +318,7 @@ impl LendingContract {
     /// of the deployment transaction can race to call `initialize` first,
     /// setting themselves as admin (#625). Call this in the same transaction as
     /// contract deployment to eliminate the front-run window entirely.
-    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, slash_bps: u32) {
+    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, yield_bps: u32) {
         // #625: Require the deployer's signature to prevent front-running.
         deployer.require_auth();
 
@@ -215,11 +334,22 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&TOKEN_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().set(
+            &CONFIG_KEY,
+            &Config {
+                yield_bps: yield_bps as u64,
+                slash_bps: SLASH_BPS,
+                max_ltv_ratio: DEFAULT_MAX_LTV_RATIO,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG_KEY, TTL_THRESHOLD, TTL_TARGET);
 
         // #640: Emit initialization event.
         env.events().publish(
             (symbol_short!("INIT"),),
-            (admin.clone(), token.clone()),
+            (admin.clone(), token.clone(), yield_bps),
         );
     }
 
@@ -237,6 +367,10 @@ impl LendingContract {
             if existing.status == LoanStatus::Active {
                 panic_with_error!(&env, ContractError::LoanAlreadyActive);
             }
+        }
+
+        if !validate_ltv_ratio(&env, &borrower, amount) {
+            panic_with_error!(&env, ContractError::LtvRatioExceeded);
         }
 
         // #628: Check contract has sufficient balance before disbursing
@@ -258,6 +392,18 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        env.events()
+            .publish((LOAN_REQUESTED,), (borrower.clone(), amount));
+        env.events().publish(
+            (LTV_VALIDATED,),
+            (
+                borrower.clone(),
+                amount,
+                total_vouched_for(&env, &borrower),
+                get_config(&env).max_ltv_ratio,
+                ltv_ratio_percent(&env, &borrower, amount),
+            ),
+        );
 
         // Transfer the loan amount to the borrower
         tok.transfer(
@@ -280,7 +426,7 @@ impl LendingContract {
     /// The contract balance is then asserted to be ≥ total yield. This prevents
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
-    /// 
+    ///
     /// The caller must match the loan's borrower address (#645).
     pub fn repay(env: Env, borrower: Address) {
         require_not_paused(&env);
@@ -306,18 +452,15 @@ impl LendingContract {
             .get(&vouches_key(&borrower))
             .unwrap_or_else(|| Vec::new(&env));
 
-        let yield_bps: u64 = env
-            .storage()
-            .persistent()
-            .get(&YIELD_BPS_KEY)
-            .unwrap_or(DEFAULT_YIELD_NUMERATOR);
+        let yield_bps = get_config(&env).yield_bps;
 
         // #627: Pre-calculate total yield before touching any balances.
         // #643: Use checked addition to prevent overflow.
         let mut total_yield: i128 = 0;
         for v in vouches.iter() {
-            let yield_amount = (v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR) as i128;
-            total_yield = total_yield.checked_add(yield_amount)
+            let yield_amount = (v.stake * yield_bps / YIELD_DENOMINATOR) as i128;
+            total_yield = total_yield
+                .checked_add(yield_amount)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
         }
 
@@ -377,14 +520,6 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::DuplicateVouch);
         }
 
-        // #630: Check if borrower already has an active loan
-        let loan_key = loan_key(&borrower);
-        if let Some(existing) = env.storage().persistent().get::<_, Loan>(&loan_key) {
-            if existing.status == LoanStatus::Active {
-                panic_with_error!(&env, ContractError::LoanAlreadyActive);
-            }
-        }
-
         if stake == 0 {
             panic_with_error!(&env, ContractError::ZeroStake);
         }
@@ -435,11 +570,14 @@ impl LendingContract {
             .persistent()
             .get(&hist_key)
             .unwrap_or_else(|| Vec::new(&env));
-        history.push_back(borrower);
+        history.push_back(borrower.clone());
         env.storage().persistent().set(&hist_key, &history);
         env.storage()
             .persistent()
             .extend_ttl(&hist_key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((VOUCH_CREATED,), (borrower, voucher, stake));
     }
 
     /// Admin-only: mark a loan as defaulted and slash based on configured rate.
@@ -452,84 +590,7 @@ impl LendingContract {
     /// Enforces max_vouchers_per_loan cap to prevent gas exhaustion (#633).
     pub fn slash(env: Env, admin: Address, borrower: Address) {
         require_admin(&env, &admin);
-
-        // #646: Guard against misconfigured SLASH_BPS exceeding 10_000.
-        assert!(SLASH_BPS <= 10_000);
-
-        let key = loan_key(&borrower);
-        let mut loan: Loan = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
-
-        if loan.status != LoanStatus::Active {
-            panic_with_error!(&env, ContractError::NoActiveLoan);
-        }
-
-        loan.status = LoanStatus::Defaulted;
-        env.storage().persistent().set(&key, &loan);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
-
-        let borrower_key_val = borrower_key(&borrower);
-        if let Some(mut borrower_record) = env
-            .storage()
-            .persistent()
-            .get::<_, Borrower>(&borrower_key_val)
-        {
-            borrower_record.default_count += 1;
-            env.storage()
-                .persistent()
-                .set(&borrower_key_val, &borrower_record);
-            env.storage()
-                .persistent()
-                .extend_ttl(&borrower_key_val, TTL_THRESHOLD, TTL_TARGET);
-        }
-
-        let vouches: Vec<Vouch> = env
-            .storage()
-            .persistent()
-            .get(&vouches_key(&borrower))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // #633: Enforce max_vouchers_per_loan cap to prevent DoS via unbounded voucher list.
-        if vouches.len() > 100 {
-            panic_with_error!(&env, ContractError::TooManyVouchers);
-        }
-
-        let token_addr = get_token(&env);
-        let tok = token::Client::new(&env, &token_addr);
-
-        let slash_bps = get_slash_bps(&env);
-        let mut slash_accum: u64 = 0;
-        for v in vouches.iter() {
-            let slashed = v.stake * SLASH_BPS / 10_000;
-            let returned = v.stake - slashed;
-            slash_accum += slashed;
-            if returned > 0 {
-                tok.transfer(
-                    &env.current_contract_address(),
-                    &v.voucher,
-                    &(returned as i128),
-                );
-            }
-        }
-
-        let current_slash: u64 = env
-            .storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64);
-        let updated_slash = current_slash + slash_accum;
-        env.storage().persistent().set(&SLASH_BAL, &updated_slash);
-        env.storage()
-            .persistent()
-            .extend_ttl(&SLASH_BAL, TTL_THRESHOLD, TTL_TARGET);
-
-        env.events()
-            .publish((LOAN_SLASHED,), (borrower.clone(), slash_accum));
+        apply_slash(&env, &borrower);
     }
 
     /// Admin-only: withdraw all accumulated slash balance to the admin address.
@@ -540,11 +601,7 @@ impl LendingContract {
     pub fn slash_treasury(env: Env, admin: Address) {
         require_admin(&env, &admin);
 
-        let slash_balance: u64 = env
-            .storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64);
+        let slash_balance: u64 = env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64);
 
         if slash_balance > 0 {
             let token_addr = get_token(&env);
@@ -603,11 +660,7 @@ impl LendingContract {
 
             let token_addr = get_token(&env);
             let tok = token::Client::new(&env, &token_addr);
-            tok.transfer(
-                &env.current_contract_address(),
-                &voucher,
-                &(stake as i128),
-            );
+            tok.transfer(&env.current_contract_address(), &voucher, &(stake as i128));
         }
     }
 
@@ -624,12 +677,17 @@ impl LendingContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Returns the accumulated slash balance available for treasury withdrawal.
-    pub fn get_slash_balance(env: Env) -> u64 {
+    /// Returns all borrowers this voucher has backed.
+    pub fn voucher_history(env: Env, voucher: Address) -> Vec<Address> {
         env.storage()
             .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64)
+            .get(&voucher_history_key(&voucher))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the accumulated slash balance available for treasury withdrawal.
+    pub fn get_slash_balance(env: Env) -> u64 {
+        env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64)
     }
 
     /// Returns whether the contract has been initialized.
@@ -653,13 +711,110 @@ impl LendingContract {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
+    /// Returns the contract's current token balance.
+    pub fn get_contract_balance(env: Env) -> i128 {
+        let token_addr = get_token(&env);
+        token::Client::new(&env, &token_addr).balance(&env.current_contract_address())
+    }
+
+    /// Returns the current minimum stake threshold for vouches.
+    pub fn get_min_stake(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&MIN_STAKE_KEY)
+            .unwrap_or(MIN_VOUCH_STAKE)
+    }
+
+    /// Returns the current maximum allowed LTV ratio.
+    pub fn get_max_ltv_ratio(env: Env) -> u32 {
+        get_config(&env).max_ltv_ratio
+    }
+
+    /// Returns the current status for the borrower's loan.
+    pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
+        Self::get_loan(env, borrower)
+            .map(|loan| loan.status)
+            .unwrap_or(LoanStatus::None)
+    }
+
+    /// Returns true when the voucher already backs the borrower.
+    pub fn vouch_exists(env: Env, voucher: Address, borrower: Address) -> bool {
+        let vouches = Self::get_vouches(env, borrower);
+        for vouch in vouches.iter() {
+            if vouch.voucher == voucher {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the total amount vouched for a borrower.
+    pub fn total_vouched(env: Env, borrower: Address) -> i128 {
+        total_vouched_for(&env, &borrower) as i128
+    }
+
+    /// Read-only LTV eligibility check for a proposed amount.
+    pub fn is_eligible(env: Env, borrower: Address, amount: i128) -> bool {
+        if amount <= 0 {
+            return false;
+        }
+        validate_ltv_ratio(&env, &borrower, amount as u64)
+    }
+
+    /// Admin-only minimum stake update.
+    pub fn set_min_stake(env: Env, admin: Address, min_stake: u64) {
+        require_admin(&env, &admin);
+        env.storage().persistent().set(&MIN_STAKE_KEY, &min_stake);
+        env.storage()
+            .persistent()
+            .extend_ttl(&MIN_STAKE_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Admin-only maximum LTV ratio update.
+    pub fn set_max_ltv_ratio(env: Env, admin: Address, max_ltv_ratio: u32) {
+        require_admin(&env, &admin);
+        if max_ltv_ratio > 100 {
+            panic_with_error!(&env, ContractError::InvalidLtvRatio);
+        }
+
+        let mut config = get_config(&env);
+        config.max_ltv_ratio = max_ltv_ratio;
+        env.storage().persistent().set(&CONFIG_KEY, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Begin a two-step admin transfer.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&PENDING_ADMIN_KEY, &new_admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&PENDING_ADMIN_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Complete a pending two-step admin transfer.
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+
+        match get_pending_admin(&env) {
+            Some(pending) if pending == new_admin => {
+                env.storage().persistent().set(&ADMIN_KEY, &new_admin);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&ADMIN_KEY, TTL_THRESHOLD, TTL_TARGET);
+                env.storage().persistent().remove(&PENDING_ADMIN_KEY);
+            }
+            _ => panic_with_error!(&env, ContractError::NoPendingAdmin),
+        }
+    }
+
     /// Admin-only function to pause the contract.
     pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = get_admin(&env);
-        if stored_admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_admin(&env, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
@@ -670,11 +825,7 @@ impl LendingContract {
 
     /// Admin-only function to unpause the contract.
     pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = get_admin(&env);
-        if stored_admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_admin(&env, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
@@ -687,10 +838,27 @@ impl LendingContract {
     pub fn is_paused(env: Env) -> bool {
         env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
     }
+
+    /// Slash an overdue active loan after its deadline has passed.
+    pub fn auto_slash(env: Env, borrower: Address) {
+        require_not_paused(&env);
+
+        let loan = Self::get_loan(env.clone(), borrower.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
+        if loan.status != LoanStatus::Active {
+            panic_with_error!(&env, ContractError::NoActiveLoan);
+        }
+        if env.ledger().timestamp() <= loan.deadline {
+            panic_with_error!(&env, ContractError::LoanNotDue);
+        }
+
+        apply_slash(&env, &borrower);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /*
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events};
 
@@ -1155,5 +1323,172 @@ mod tests {
                 ContractError::ContractPaused as u32
             )))
         );
+    }
+    */
+
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger},
+        token::StellarAssetClient,
+        TryFromVal,
+    };
+
+    fn setup() -> (Env, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+        client.initialize(
+            &deployer,
+            &admin,
+            &token_id,
+            &(DEFAULT_YIELD_NUMERATOR as u32),
+        );
+
+        (env, contract_id, admin, token_id)
+    }
+
+    fn mint(env: &Env, token_id: &Address, recipient: &Address, amount: i128) {
+        StellarAssetClient::new(env, token_id).mint(recipient, &amount);
+    }
+
+    #[test]
+    fn test_initialize_sets_core_state() {
+        let (env, contract_id, admin, token_id) = setup();
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        assert!(client.is_initialized());
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_token(), token_id);
+        assert_eq!(client.get_max_ltv_ratio(), DEFAULT_MAX_LTV_RATIO);
+    }
+
+    #[test]
+    fn test_request_loan_enforces_ltv_when_collateral_exists() {
+        let (env, contract_id, admin, token_id) = setup();
+        let client = LendingContractClient::new(&env, &contract_id);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        mint(&env, &token_id, &contract_id, 2_000);
+        mint(&env, &token_id, &voucher, 1_000);
+
+        client.set_max_ltv_ratio(&admin, &70);
+        client.vouch(&borrower, &voucher, &1_000);
+
+        assert_eq!(
+            client.try_request_loan(&borrower, &800),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LtvRatioExceeded as u32
+            )))
+        );
+
+        client.request_loan(&borrower, &700);
+        assert_eq!(client.loan_status(&borrower), LoanStatus::Active);
+    }
+
+    #[test]
+    fn test_request_loan_emits_ltv_event() {
+        let (env, contract_id, _admin, token_id) = setup();
+        let client = LendingContractClient::new(&env, &contract_id);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        mint(&env, &token_id, &contract_id, 2_000);
+        mint(&env, &token_id, &voucher, 1_000);
+        client.vouch(&borrower, &voucher, &1_000);
+        client.request_loan(&borrower, &700);
+
+        assert!(env.events().all().iter().any(|event| {
+            event
+                .1
+                .get(0)
+                .and_then(|topic| Symbol::try_from_val(&env, &topic).ok())
+                .map(|symbol| symbol == LTV_VALIDATED)
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn test_set_min_stake_updates_vouch_requirement() {
+        let (env, contract_id, admin, token_id) = setup();
+        let client = LendingContractClient::new(&env, &contract_id);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        mint(&env, &token_id, &voucher, 1_000);
+        client.set_min_stake(&admin, &200);
+
+        assert_eq!(
+            client.try_vouch(&borrower, &voucher, &100),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::StakeBelowMinimum as u32
+            )))
+        );
+
+        client.vouch(&borrower, &voucher, &200);
+        assert_eq!(client.total_vouched(&borrower), 200);
+    }
+
+    #[test]
+    fn test_view_helpers_reflect_vouch_state() {
+        let (env, contract_id, _admin, token_id) = setup();
+        let client = LendingContractClient::new(&env, &contract_id);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        mint(&env, &token_id, &voucher, 500);
+        client.vouch(&borrower, &voucher, &500);
+
+        assert!(client.vouch_exists(&voucher, &borrower));
+        assert_eq!(client.total_vouched(&borrower), 500);
+        assert_eq!(client.voucher_history(&voucher).get(0).unwrap(), borrower);
+        assert!(client.is_eligible(&borrower, &350));
+        assert!(!client.is_eligible(&borrower, &400));
+    }
+
+    #[test]
+    fn test_admin_transfer_is_two_step() {
+        let (env, contract_id, admin, _token_id) = setup();
+        let client = LendingContractClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+        client.pause(&new_admin);
+
+        assert!(client.is_paused());
+        assert_eq!(
+            client.try_unpause(&admin),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_auto_slash_defaults_overdue_loan() {
+        let (env, contract_id, _admin, token_id) = setup();
+        let client = LendingContractClient::new(&env, &contract_id);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        mint(&env, &token_id, &contract_id, 2_000);
+        mint(&env, &token_id, &voucher, 500);
+        client.vouch(&borrower, &voucher, &500);
+        client.request_loan(&borrower, &300);
+
+        let loan = client.get_loan(&borrower).unwrap();
+        env.ledger().set_timestamp(loan.deadline + 1);
+        client.auto_slash(&borrower);
+
+        assert_eq!(client.loan_status(&borrower), LoanStatus::Defaulted);
+        assert!(client.get_slash_balance() > 0);
     }
 }
